@@ -2,6 +2,7 @@
 accounts.json
 .trae_token_cache.json
 .trae_state.json
+.balance_delta.json
 logs/
 __pycache__/
 *.pyc
