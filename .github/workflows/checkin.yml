@@ -46,7 +46,7 @@ jobs:
           restore-keys: |
             trae-token-
 
-      - name: 执行签到
+      - name: 执行签到（签到前后各读一次余额）
         id: checkin
         env:
           TRAE_ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
@@ -55,7 +55,7 @@ jobs:
           TRAE_WEBHOOK: ${{ secrets.TRAE_WEBHOOK }}
         run: |
           set -o pipefail
-          python 03_checkin.py 2>&1 | tee checkin.log
+          python checkin_with_balance.py 2>&1 | tee checkin.log
 
       # always()：签到失败时这条也要跑，否则失败没人知道（除了 GitHub 邮件）。
       # 注意：不看进程退出码 —— 脚本在「今日已签」和「9074 冷却」时都退出 0，
@@ -66,7 +66,7 @@ jobs:
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         run: |
-          python notify_feishu.py --log checkin.log \
+          python notify_feishu.py --log checkin.log --delta-file .balance_delta.json \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       # GitHub 会在仓库连续 60 天无提交时暂停定时任务（定时任务一停就不会有
