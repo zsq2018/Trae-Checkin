@@ -1,0 +1,53 @@
+name: Trae 每日签到
+
+# 上游 wallechfox/Trae-Checkin 的 README 描述了云端签到，但仓库里没有提交
+# 这个 workflow 文件，这里按 README 的说明补齐。
+#
+# 依赖的仓库 Secret：
+#   TRAE_ACCOUNTS   必填，accounts.json 里 accounts 数组那一整段 JSON
+#   QYWX_TOKEN      选填，企业微信机器人 key
+#   PLUSPLUS_TOKEN  选填，PushPlus token
+#   TRAE_WEBHOOK    选填，自定义 webhook
+
+on:
+  schedule:
+    # GitHub 的 schedule 一律按 UTC。23 16 * * * = 北京时间次日 00:23。
+    # 避开整点（00:00~00:10 最挤），实测 00:15~00:45 成功率最高。
+    - cron: '23 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # refreshToken 每次续期都会产生新值、旧值随即作废，而 Actions 的工作目录
+      # 是一次性的。必须把续期后的新 token 用缓存带到下一次运行，否则第二次
+      # 运行就会拿 TRAE_ACCOUNTS 里那份已经作废的 token 去登录，必然失败。
+      # key 带 run_id 是为了每次都写入一份新缓存（同名缓存不可覆盖），
+      # restore-keys 负责下次取回最近的那一份。
+      - name: 恢复 token 缓存
+        uses: actions/cache@v4
+        with:
+          path: .trae_token_cache.json
+          key: trae-token-${{ github.run_id }}
+          restore-keys: |
+            trae-token-
+
+      - name: 执行签到
+        env:
+          TRAE_ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
+          QYWX_TOKEN: ${{ secrets.QYWX_TOKEN }}
+          PLUSPLUS_TOKEN: ${{ secrets.PLUSPLUS_TOKEN }}
+          TRAE_WEBHOOK: ${{ secrets.TRAE_WEBHOOK }}
+        run: python 03_checkin.py
