@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""按**严格口径**把 03_checkin.py 的运行结果推送到飞书。
+"""按**严格口径**把签到结果推送到飞书：必须看到余额增长才算「真领到」。
 
 为什么需要它
 ────────────────────────────────────────────────────────────
-03_checkin.py 的退出码只区分「有失败/异常」和「其他」：
-  • 服务端返回 9095（今日已签）→ 退出 0
-  • 9074 冷却中（本次没领到）  → 退出 0
-直接用退出码发通知，就会把「本次根本没领到积分」说成「签到成功」。
-所以这里从日志的汇总行反推真实结果，三种口径严格互斥：
+1) 03_checkin.py 的退出码只区分「有失败/异常」和「其他」：
+   • 服务端返回 9095（今日已签）→ 退出 0
+   • 9074 冷却中（本次没领到）  → 退出 0
+   按退出码发通知，会把「本次根本没领到积分」说成「签到成功」。
+2) claim 返回 code=0 只是服务端"受理了"，不等于积分一定进了账。
+   所以再由 checkin_with_balance.py 提供签到前后的余额对比，
+   **只有余额确实增加**才判为「真实领到」。
 
-  ✅ 真实签到成功  成功 > 0        —— claim 接口返回 code=0，积分确实到账
-  ☑️ 今日已签      成功 = 0 且 已签 > 0
-                                  —— 服务端说今天已领过，**本次没有发起新的领取**
-  ❌ 需要处理      待重试 > 0 或 失败 > 0 或 日志里找不到汇总行
-                                  —— 9074 冷却 / 鉴权失败 / 脚本异常
+判定口径（互斥，从强到弱）
+────────────────────────────────────────────────────────────
+  ✅ 真实领到    成功 > 0 且 余额增加        —— 服务端受理 + 余额对得上
+  ⚠️ 可疑        成功 > 0 但余额没增加/无对比数据
+                                            —— code=0 但钱没到，需人工核对
+  ☑️ 今日已签    成功 = 0 且 已签 > 0        —— 本次没发起领取（别处已领）
+  ❌ 需要处理    待重试 > 0 / 失败 > 0 / 无汇总行
+                                            —— 9074 冷却 / 鉴权失败 / 崩溃
 
 退出码
 ────────────────────────────────────────────────────────────
-  0 = 判定为 ✅ 或 ☑️（都不需要人工介入）
-  1 = ❌ / 无法判定 / 飞书发送失败
-      （让 Actions 变红，GitHub 失败邮件作为第二道兜底）
+  0 = ✅ 或 ☑️（不需要人工介入）
+  1 = ⚠️ / ❌ / 飞书发送失败（让 Actions 变红，GitHub 失败邮件兜底）
 
 用法
 ────────────────────────────────────────────────────────────
   FEISHU_WEBHOOK=xxx python3 notify_feishu.py --log checkin.log
-  python3 notify_feishu.py --log checkin.log --dry-run     # 只打印，不发
+  python3 notify_feishu.py --log checkin.log --delta-file .balance_delta.json --dry-run
 """
 
 import argparse
@@ -33,10 +37,20 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
 TIMEOUT = 15
+
+
+def fmt_num(v):
+    if v is None:
+        return "-"
+    try:
+        return ("%.2f" % float(v)).rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(v)
 
 
 def parse_summary(text):
@@ -60,9 +74,9 @@ def parse_account_count(text):
 
 
 def evidence_lines(text, limit=5):
-    """挑出能自证的关键行（服务端原始响应、冷却/鉴权失败提示）。"""
+    """挑出能自证的关键行（服务端原始响应、冷却/鉴权失败提示、余额快照）。"""
     keys = ("status HTTP", "claim HTTP", "冷却", "鉴权", "Token 无效",
-            "Traceback", "没有可用账号", "缺设备号")
+            "Traceback", "没有可用账号", "缺设备号", "余额")
     out, seen = [], set()
     for line in text.splitlines():
         s = line.strip().strip("║").strip()
@@ -74,15 +88,41 @@ def evidence_lines(text, limit=5):
     return out[-limit:]
 
 
-def build(log_text, run_url):
-    """返回 (icon, title, note, evidence, need_attention, summary)。"""
+def balance_summary(delta):
+    """返回 (可读文案, 最差差额)。数据缺失返回 (None, None)。"""
+    if not isinstance(delta, dict):
+        return None, None
+    rows = delta.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None, None
+    parts, worst = [], None
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("name") or "?"
+        b, a, d = r.get("before"), r.get("after"), r.get("delta")
+        if b is None or a is None:
+            parts.append("%s：无法对比" % name)
+            continue
+        sign = "+" if (d or 0) > 0 else ""
+        parts.append("%s：%s → %s（%s%s）" % (name, fmt_num(b), fmt_num(a), sign, fmt_num(d)))
+        worst = d if worst is None else min(worst, d)
+    if not parts:
+        return None, None
+    return "；".join(parts), worst
+
+
+def build(log_text, delta=None):
+    """返回 (icon, title, note, evidence, need_attention, summary, balance)。"""
     s = parse_summary(log_text)
     ev = evidence_lines(log_text)
+    bal, worst = balance_summary(delta)
+
     if s is None:
         return ("❌", "Trae 签到异常：日志里没有签到汇总",
                 "脚本可能中途崩溃或配置有问题，请点开运行日志查看。",
                 ev or [l.strip() for l in log_text.splitlines() if l.strip()][-5:],
-                True, None)
+                True, None, bal)
 
     ok, already, retry, failed = s
     summary = "✅ 成功 %d   ☑️ 已签 %d   ⏳ 待重试 %d   ❌ 失败 %d" % s
@@ -90,25 +130,35 @@ def build(log_text, run_url):
     if failed > 0:
         return ("❌", "Trae 签到失败（%d 个账号出错）" % failed,
                 "鉴权失败 / 异常 —— 需要重新登录或排查，见下方证据。",
-                ev, True, summary)
+                ev, True, summary, bal)
     if retry > 0:
         return ("❌", "Trae 今日没领到积分（%d 个账号被 9074 冷却）" % retry,
                 "9074「当前参与用户太多」实测多是设备号或风控问题，本次未领到，"
                 "明天同一时间会自动重试。",
-                ev, True, summary)
+                ev, True, summary, bal)
     if ok > 0:
-        extra = "，另有 %d 个账号今日已签" % already if already else ""
-        return ("✅", "Trae 签到成功：本次真实领到积分（%d 个账号）" % ok,
-                "claim 接口返回 code=0，积分已到账%s。" % extra,
-                ev, False, summary)
+        if bal is None:
+            return ("⚠️", "Trae 服务端返回成功，但缺少余额对比数据",
+                    "claim 返回 code=0，但没有拿到签到前后的余额，**无法确认积分真的到账**，"
+                    "请人工核对一次（或看下方证据）。",
+                    ev, True, summary, bal)
+        if (worst or 0) > 0:
+            extra = "，另有 %d 个账号今日已签" % already if already else ""
+            return ("✅", "Trae 签到成功：已核对余额增加（%d 个账号）" % ok,
+                    "claim 返回 code=0 且签到前后余额确实增加，积分已到账%s。" % extra,
+                    ev, False, summary, bal)
+        return ("⚠️", "Trae 服务端返回成功，但余额没有增加",
+                "claim 返回 code=0，可是签到前后余额没有变化 —— "
+                "可能是服务端记账延迟，也可能是这次领取没真正到账，**请人工核对一次**。",
+                ev, True, summary, bal)
     if already > 0:
         return ("☑️", "Trae 今日已签（本次未新领积分）",
                 "服务端显示今日已领取，本次**没有发起新的领取** —— "
                 "积分是今天更早时候（很可能是客户端手点）领走的，脚本本身没出错。",
-                ev, False, summary)
+                ev, False, summary, bal)
     return ("❌", "Trae 签到未执行",
             "汇总行显示 0 个账号被处理，检查账号配置与 Secret。",
-            ev, True, summary)
+            ev, True, summary, bal)
 
 
 def send(webhook, text):
@@ -124,6 +174,7 @@ def send(webhook, text):
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default="checkin.log")
+    ap.add_argument("--delta-file", default=".balance_delta.json")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
@@ -134,13 +185,22 @@ def main(argv):
     except OSError:
         log_text = ""
 
-    icon, title, note, ev, need, summary = build(log_text, a.run_url)
+    delta = None
+    try:
+        with open(a.delta_file, "r", encoding="utf-8", errors="replace") as fh:
+            delta = json.load(fh)
+    except (OSError, ValueError):
+        delta = None
+
+    icon, title, note, ev, need, summary, bal = build(log_text, delta)
 
     lines = ["%s %s" % (icon, title),
-             "时间：%s（北京时间）" % __import__("time").strftime("%Y-%m-%d %H:%M"),
+             "时间：%s（北京时间）" % time.strftime("%Y-%m-%d %H:%M"),
              "账号数：%s" % parse_account_count(log_text)]
     if summary:
         lines.append("汇总：%s" % summary)
+    if bal:
+        lines.append("余额：%s" % bal)
     lines.append("说明：%s" % note)
     if ev:
         lines.append("—— 服务端证据 ——")
