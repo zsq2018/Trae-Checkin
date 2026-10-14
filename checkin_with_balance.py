@@ -35,8 +35,8 @@ sys.path.insert(0, HERE)
 import trae_core as T  # noqa: E402
 
 DELTA_FILE = os.path.join(HERE, ".balance_delta.json")
-REREAD_WAIT = 5          # 余额未变时的重读间隔（秒）
-REREAD_TIMES = 3         # 重读次数
+REREAD_WAIT = 10         # 余额未变时的重读间隔（秒）
+REREAD_TIMES = 6         # 重读次数（最长等 60 秒，避免服务端记账延迟造成误报）
 
 
 class Tee(io.TextIOBase):
