@@ -178,6 +178,20 @@ def build(log_text, delta=None):
             ev, True, summary, bal)
 
 
+def all_skipped_by_state(text):
+    """本轮账号是否全部被脚本自己的「今日已完成」记账跳过。
+
+    补签轮（北京时间 01:23）会遇到这种空跑：主轮已经领到了，脚本读到自己
+    记的账就直接跳过，不发任何领取请求。这种空跑不该再推一条通知刷屏 ——
+    真出事（鉴权失败 / 9074）时不会有「今日已完成」记账，不会被误吞。
+    """
+    try:
+        n = int(parse_account_count(text))
+    except (TypeError, ValueError):
+        return False
+    return n > 0 and len(re.findall(r"今日已完成", text)) >= n
+
+
 def send(webhook, text):
     payload = json.dumps({"msg_type": "text", "content": {"text": text}},
                          ensure_ascii=False).encode("utf-8")
@@ -210,6 +224,10 @@ def main(argv):
         delta = None
 
     icon, title, note, ev, need, summary, bal = build(log_text, delta)
+
+    if icon == "☑️" and all_skipped_by_state(log_text):
+        print("=== 补签轮空跑：账号都已被脚本自己的「今日已完成」记账跳过，不推送 ===")
+        return 0
 
     lines = ["%s %s" % (icon, title),
              "时间：%s（北京时间）" % bj_now(),
