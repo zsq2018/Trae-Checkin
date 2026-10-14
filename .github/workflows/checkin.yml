@@ -2,7 +2,8 @@ name: Trae 每日签到
 
 # 上游 wallechfox/Trae-Checkin 的 README 描述了云端签到，但仓库里没有提交
 # 这个 workflow 文件，这里按 README 的说明补齐，并额外加了：
-#   • 飞书群机器人通知（成功/失败都推，脚本自带的 webhook 是企微格式，飞书不收）
+#   • 飞书群机器人通知（成功/已签/失败三种口径严格区分，见 notify_feishu.py；
+#     脚本自带的 webhook 是企微格式，飞书不收）
 #   • 每月保活提交，避免 GitHub 因长期无提交暂停定时任务
 #
 # 依赖的仓库 Secret：
@@ -56,31 +57,17 @@ jobs:
           set -o pipefail
           python 03_checkin.py 2>&1 | tee checkin.log
 
-      # always()：签到失败时这条也要跑，否则失败没人知道（除了 GitHub 邮件）
-      - name: 飞书通知
+      # always()：签到失败时这条也要跑，否则失败没人知道（除了 GitHub 邮件）。
+      # 注意：不看进程退出码 —— 脚本在「今日已签」和「9074 冷却」时都退出 0，
+      # 按退出码发通知会把「本次根本没领到积分」说成「签到成功」。
+      # notify_feishu.py 改为从日志汇总行反推，三种口径严格互斥，见该文件注释。
+      - name: 飞书通知（严格口径）
         if: always()
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          OUTCOME: ${{ steps.checkin.outcome }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -eu
-          if [ -z "${FEISHU_WEBHOOK:-}" ]; then
-            echo "未配置 FEISHU_WEBHOOK，跳过飞书通知"
-            exit 0
-          fi
-          if [ "$OUTCOME" = "success" ]; then
-            ICON="✅"; TITLE="Trae 每日签到成功"
-          else
-            ICON="❌"; TITLE="Trae 每日签到失败，需要处理"
-          fi
-          SUMMARY="$(tail -n 12 checkin.log 2>/dev/null || echo '（无日志）')"
-          TEXT="$(printf '%s %s\n时间：%s\n\n%s\n\n日志：%s' \
-            "$ICON" "$TITLE" "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')" "$SUMMARY" "$RUN_URL")"
-          jq -n --arg t "$TEXT" '{msg_type:"text",content:{text:$t}}' > payload.json
-          echo "--- 飞书返回 ---"
-          curl -sS -X POST "$FEISHU_WEBHOOK" -H 'Content-Type: application/json' --data-binary @payload.json
-          echo
+          python notify_feishu.py --log checkin.log \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       # GitHub 会在仓库连续 60 天无提交时暂停定时任务（定时任务一停就不会有
       # 失败通知，属于静默死亡）。每月 1 号成功签到后提交一次时间戳保活。
