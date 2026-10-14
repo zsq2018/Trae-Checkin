@@ -24,10 +24,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 准备 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -37,7 +37,7 @@ jobs:
       # key 带 run_id 是为了每次都写入一份新缓存（同名缓存不可覆盖），
       # restore-keys 负责下次取回最近的那一份。
       - name: 恢复 token 缓存
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .trae_token_cache.json
           key: trae-token-${{ github.run_id }}
