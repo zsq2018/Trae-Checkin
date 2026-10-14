@@ -1,6 +1,7 @@
 # 凭据与运行产物 —— 绝不要提交（公开 fork 尤其重要）
 accounts.json
 .trae_token_cache.json
+.trae_state.json
 logs/
 __pycache__/
 *.pyc
