@@ -1,13 +1,14 @@
 name: Trae 每日签到
 
 # 上游 wallechfox/Trae-Checkin 的 README 描述了云端签到，但仓库里没有提交
-# 这个 workflow 文件，这里按 README 的说明补齐。
+# 这个 workflow 文件，这里按 README 的说明补齐，并额外加了：
+#   • 飞书群机器人通知（成功/失败都推，脚本自带的 webhook 是企微格式，飞书不收）
+#   • 每月保活提交，避免 GitHub 因长期无提交暂停定时任务
 #
 # 依赖的仓库 Secret：
 #   TRAE_ACCOUNTS   必填，accounts.json 里 accounts 数组那一整段 JSON
-#   QYWX_TOKEN      选填，企业微信机器人 key
-#   PLUSPLUS_TOKEN  选填，PushPlus token
-#   TRAE_WEBHOOK    选填，自定义 webhook
+#   FEISHU_WEBHOOK  选填，飞书群「自定义机器人」的 webhook 地址
+#   QYWX_TOKEN / PLUSPLUS_TOKEN / TRAE_WEBHOOK  选填，脚本自带的其他推送
 
 on:
   schedule:
@@ -17,7 +18,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write      # 仅「保活」提交需要写权限；其余步骤都不写仓库
 
 jobs:
   checkin:
@@ -45,9 +46,54 @@ jobs:
             trae-token-
 
       - name: 执行签到
+        id: checkin
         env:
           TRAE_ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
           QYWX_TOKEN: ${{ secrets.QYWX_TOKEN }}
           PLUSPLUS_TOKEN: ${{ secrets.PLUSPLUS_TOKEN }}
           TRAE_WEBHOOK: ${{ secrets.TRAE_WEBHOOK }}
-        run: python 03_checkin.py
+        run: |
+          set -o pipefail
+          python 03_checkin.py 2>&1 | tee checkin.log
+
+      # always()：签到失败时这条也要跑，否则失败没人知道（除了 GitHub 邮件）
+      - name: 飞书通知
+        if: always()
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          OUTCOME: ${{ steps.checkin.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          if [ -z "${FEISHU_WEBHOOK:-}" ]; then
+            echo "未配置 FEISHU_WEBHOOK，跳过飞书通知"
+            exit 0
+          fi
+          if [ "$OUTCOME" = "success" ]; then
+            ICON="✅"; TITLE="Trae 每日签到成功"
+          else
+            ICON="❌"; TITLE="Trae 每日签到失败，需要处理"
+          fi
+          SUMMARY="$(tail -n 12 checkin.log 2>/dev/null || echo '（无日志）')"
+          TEXT="$(printf '%s %s\n时间：%s\n\n%s\n\n日志：%s' \
+            "$ICON" "$TITLE" "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')" "$SUMMARY" "$RUN_URL")"
+          jq -n --arg t "$TEXT" '{msg_type:"text",content:{text:$t}}' > payload.json
+          echo "--- 飞书返回 ---"
+          curl -sS -X POST "$FEISHU_WEBHOOK" -H 'Content-Type: application/json' --data-binary @payload.json
+          echo
+
+      # GitHub 会在仓库连续 60 天无提交时暂停定时任务（定时任务一停就不会有
+      # 失败通知，属于静默死亡）。每月 1 号成功签到后提交一次时间戳保活。
+      - name: 保活提交（每月 1 号）
+        if: github.event_name == 'schedule' && steps.checkin.outcome == 'success'
+        run: |
+          if [ "$(TZ=Asia/Shanghai date +%d)" != "01" ]; then
+            echo "非每月 1 号，跳过保活提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .keepalive
+          git add .keepalive
+          git commit -m "chore: keepalive $(date -u +%F)" || exit 0
+          git push
