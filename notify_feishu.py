@@ -42,6 +42,13 @@ import urllib.error
 import urllib.request
 
 TIMEOUT = 15
+BEIJING_OFFSET = 8 * 3600          # 中国无夏令时，固定 UTC+8
+
+
+def bj_now():
+    """北京时间字符串。Actions runner 的本地时区是 UTC，
+    直接 strftime 会把 UTC 当成北京时间写进通知（曾把 21:09 写成 13:09）。"""
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + BEIJING_OFFSET))
 
 
 def fmt_num(v):
@@ -74,15 +81,18 @@ def parse_account_count(text):
 
 
 def evidence_lines(text, limit=5):
-    """挑出能自证的关键行（服务端原始响应、冷却/鉴权失败提示、余额快照）。"""
-    keys = ("status HTTP", "claim HTTP", "冷却", "鉴权", "Token 无效",
-            "Traceback", "没有可用账号", "缺设备号", "余额")
+    """挑出能自证的关键行：服务端原始响应、余额数字、报错。
+    注意排除快照/写入/分隔线这类纯过程日志 —— 它们会喧宾夺主，
+    让通知看起来像贴了半篇日志。"""
+    keep = ("status HTTP", "claim HTTP", "💰", "冷却", "鉴权", "Token 无效",
+            "Traceback", "没有可用账号", "缺设备号")
+    drop = ("📸", "🧾", "=====", "余额对比", "[余额]")
     out, seen = [], set()
     for line in text.splitlines():
         s = line.strip().strip("║").strip()
-        if not s or s in seen:
+        if not s or s in seen or any(k in s for k in drop):
             continue
-        if any(k in s for k in keys):
+        if any(k in s for k in keep):
             seen.add(s)
             out.append(s)
     return out[-limit:]
@@ -104,8 +114,15 @@ def balance_summary(delta):
         if b is None or a is None:
             parts.append("%s：无法对比" % name)
             continue
-        sign = "+" if (d or 0) > 0 else ""
-        parts.append("%s：%s → %s（%s%s）" % (name, fmt_num(b), fmt_num(a), sign, fmt_num(d)))
+        if d is None:
+            d_txt = "?"
+        elif d == 0:
+            d_txt = "无变化"
+        elif d > 0:
+            d_txt = "+" + fmt_num(d)
+        else:
+            d_txt = fmt_num(d)
+        parts.append("%s：%s → %s（%s）" % (name, fmt_num(b), fmt_num(a), d_txt))
         worst = d if worst is None else min(worst, d)
     if not parts:
         return None, None
@@ -195,7 +212,7 @@ def main(argv):
     icon, title, note, ev, need, summary, bal = build(log_text, delta)
 
     lines = ["%s %s" % (icon, title),
-             "时间：%s（北京时间）" % time.strftime("%Y-%m-%d %H:%M"),
+             "时间：%s（北京时间）" % bj_now(),
              "账号数：%s" % parse_account_count(log_text)]
     if summary:
         lines.append("汇总：%s" % summary)
