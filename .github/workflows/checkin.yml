@@ -13,9 +13,14 @@ name: Trae 每日签到
 
 on:
   schedule:
-    # GitHub 的 schedule 一律按 UTC。23 16 * * * = 北京时间次日 00:23。
-    # 避开整点（00:00~00:10 最挤），实测 00:15~00:45 成功率最高。
+    # GitHub 的 schedule 一律按 UTC。
+    #   '23 16 * * *' = 北京时间次日 00:23（主轮，脚本作者实测成功率最高的窗口）
+    #   '23 17 * * *' = 北京时间次日 01:23（补签轮）
+    # 加补签轮的原因：脚本遇到 9074 是「不重试、记 30 分钟冷却、交给下一轮 cron」，
+    # 只跑一次的话撞上 9074 / 网络抖动就白丢一天。两轮间隔 60 分 > 30 分冷却，
+    # 且签到是幂等的（已领到的一轮之后只会查询、不会重复领）。
     - cron: '23 16 * * *'
+    - cron: '23 17 * * *'
   workflow_dispatch:
 
 permissions:
@@ -41,7 +46,11 @@ jobs:
       - name: 恢复 token 缓存
         uses: actions/cache@v6
         with:
-          path: .trae_token_cache.json
+          # .trae_state.json 是脚本的「今日已完成」记账：把它一起缓存后，
+          # 补签轮会直接跳过（只查询、不重复领），通知也不会重复推送。
+          path: |
+            .trae_token_cache.json
+            .trae_state.json
           key: trae-token-${{ github.run_id }}
           restore-keys: |
             trae-token-
