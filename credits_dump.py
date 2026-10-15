@@ -1,36 +1,71 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""手动查看积分明细（含到期时间）—— 只读，不签到、不改任何状态。
+"""手动查看积分明细：每笔权益包的**数量 + 到期时间**（只读，不签到、不改状态）。
 
 为什么单独写一个：
-  每日通知里只报「总额 / 已用 / 剩余」这几个汇总数，看不出**每笔积分什么时候过期**。
-  官方规则说签到积分有效期是 31 个自然日，所以"剩余 4600"里可能有一部分快到期了。
-  这个脚本把权益接口的原始结构（含到期字段）打出来，用于人工核对。
+  每日通知只报「总额 / 已用 / 剩余」汇总数，看不出**每笔积分什么时候过期**。
+  官方规则：每日签到积分有效期 31 个自然日；每月登录赠送的 500 分是「当前自然月」。
+  所以"剩余 4600"里往往有几批不同到期日的积分，快过期的那批要优先花掉。
 
-用法：在 GitHub Actions 里手动触发 `积分明细（手动）` 工作流。
+用法：GitHub Actions 里手动触发 `积分明细（手动）` 工作流。
 """
 
 import json
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import trae_core as T  # noqa: E402
 
-KEYS = ("expire", "expiry", "end_time", "endtime", "deadline", "valid", "effective", "due")
+BJ = 8 * 3600
 
 
-def walk(obj, path=""):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            yield from walk(v, path + "." + str(k))
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj[:50]):
-            yield from walk(v, path + "[%d]" % i)
-    else:
-        yield path, obj
+def bj(ts):
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        return "-"
+    if ts <= 0:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts + BJ))
+
+
+def pack_amount(p):
+    """尽力从权益包里找出「数量/剩余」字段。"""
+    for k in ("amount", "total_amount", "total", "quantity", "quota",
+              "remain_amount", "remaining_amount", "balance", "num"):
+        v = p.get(k)
+        if isinstance(v, (int, float)):
+            return k, v
+    bi = p.get("entitlement_base_info")
+    if isinstance(bi, dict):
+        for k in ("amount", "total_amount", "total", "quantity"):
+            v = bi.get(k)
+            if isinstance(v, (int, float)):
+                return "entitlement_base_info." + k, v
+    return None, None
+
+
+def describe(p, root):
+    """把包里与「这是什么积分、有多少、何时到期」相关的键挑出来。"""
+    out = {}
+    for k in ("id", "name", "title", "type", "entitlement_type", "status",
+              "amount", "total_amount", "total", "quantity", "quota",
+              "used_amount", "consumed_amount", "remain_amount",
+              "remaining_amount", "balance", "num",
+              "expire_time", "start_time", "create_time", "yearly_expire_time"):
+        if k in p:
+            out[k] = p[k]
+    bi = p.get("entitlement_base_info")
+    if isinstance(bi, dict):
+        for k in ("id", "name", "title", "type", "amount", "total_amount",
+                  "start_time", "end_time"):
+            if k in bi:
+                out["base." + k] = bi[k]
+    return out
 
 
 def main():
@@ -41,23 +76,19 @@ def main():
         name = acc.get("name") or acc.get("uid") or "?"
         dev, src = T.resolve_device_id(acc)
         print()
-        print("=" * 68)
+        print("=" * 70)
         print("账号: %s   设备号: %s (%s)" % (name, dev, src))
         ok, msg = T.ensure_token(acc)
         if not ok:
             print("  ❌ 凭证不可用: %s" % msg)
             continue
 
-        root = None
-        for body in ('{"require_usage": true, "full_data": true}', "{}"):
-            headers = T.ug_headers(acc["accessToken"], dev, acc.get("region"))
-            status, d, raw = T.http_post(T.EP_ENTITLE, headers, body, 20)
-            print("  权益接口 HTTP %s  body=%s" % (status, body))
-            if isinstance(d, (dict, list)):
-                root = d
-                break
-            print("   原始响应: %s" % str(raw)[:300])
-        if root is None:
+        headers = T.ug_headers(acc["accessToken"], dev, acc.get("region"))
+        status, root, raw = T.http_post(
+            T.EP_ENTITLE, headers, '{"require_usage": true, "full_data": true}', 20)
+        print("  权益接口 HTTP %s" % status)
+        if not isinstance(root, (dict, list)):
+            print("  原始响应: %s" % str(raw)[:300])
             continue
 
         data = root.get("data") if isinstance(root, dict) and isinstance(root.get("data"), dict) else root
@@ -65,15 +96,25 @@ def main():
         if isinstance(us, dict):
             print("  用量汇总: %s" % json.dumps(us, ensure_ascii=False))
 
-        hits = [(p, v) for p, v in walk(root)
-                if any(k in p.lower() for k in KEYS)]
-        if hits:
-            print("  —— 含到期 / 有效期字样的字段 ——")
-            for p, v in hits[:60]:
-                print("    %s = %s" % (p, v))
-        else:
-            print("  未发现到期字段；完整结构（截断 4000 字符）:")
-            print(json.dumps(root, ensure_ascii=False, indent=1)[:4000])
+        packs = T.pick(data, "user_entitlement_pack_list", "userEntitlementPackList") or []
+        if not isinstance(packs, list):
+            packs = []
+        print("  权益包数量: %d" % len(packs))
+        print()
+        now = time.time()
+        for i, p in enumerate(packs):
+            if not isinstance(p, dict):
+                continue
+            exp = p.get("expire_time") or (p.get("entitlement_base_info") or {}).get("end_time")
+            left = ""
+            try:
+                d = (int(exp) - now) / 86400.0
+                left = "  剩 %.1f 天" % d
+            except (TypeError, ValueError):
+                pass
+            k, v = pack_amount(p)
+            print("  [%d] 数量 %s=%s   到期 %s%s" % (i, k or "?", v, bj(exp), left))
+            print("      %s" % json.dumps(describe(p, root), ensure_ascii=False))
     print()
     print("完成（只读，未做任何修改）。")
     return 0
