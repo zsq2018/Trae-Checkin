@@ -98,14 +98,19 @@ def evidence_lines(text, limit=5):
     return out[-limit:]
 
 
-def balance_summary(delta):
-    """返回 (可读文案, 最差差额)。数据缺失返回 (None, None)。"""
+def balance_stats(delta):
+    """返回 (可读文案, 余额增加的账号数, 最小差额, 取不到余额的账号数)。
+
+    多账号时必须**按账号分别看**：老账号"今日已签"（差额 0）与新账号"真领到"
+    （差额 +100）同时出现是完全正常的。早期版本用所有账号的最小差额判定，
+    结果把这种正常情况误报成「余额没有增加」—— 2026-10-15 多账号上线时真实踩到。
+    """
     if not isinstance(delta, dict):
-        return None, None
+        return None, None, None, 0
     rows = delta.get("rows")
     if not isinstance(rows, list) or not rows:
-        return None, None
-    parts, worst = [], None
+        return None, None, None, 0
+    parts, pos, worst, unknown = [], 0, None, 0
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -113,6 +118,7 @@ def balance_summary(delta):
         b, a, d = r.get("before"), r.get("after"), r.get("delta")
         if b is None or a is None:
             parts.append("%s：无法对比" % name)
+            unknown += 1
             continue
         if d is None:
             d_txt = "?"
@@ -123,17 +129,20 @@ def balance_summary(delta):
         else:
             d_txt = fmt_num(d)
         parts.append("%s：%s → %s（%s）" % (name, fmt_num(b), fmt_num(a), d_txt))
-        worst = d if worst is None else min(worst, d)
+        if d is not None:
+            if d > 0:
+                pos += 1
+            worst = d if worst is None else min(worst, d)
     if not parts:
-        return None, None
-    return "；".join(parts), worst
+        return None, None, None, 0
+    return "；".join(parts), pos, worst, unknown
 
 
 def build(log_text, delta=None):
     """返回 (icon, title, note, evidence, need_attention, summary, balance)。"""
     s = parse_summary(log_text)
     ev = evidence_lines(log_text)
-    bal, worst = balance_summary(delta)
+    bal, pos, worst, unknown = balance_stats(delta)
 
     if s is None:
         return ("❌", "Trae 签到异常：日志里没有签到汇总",
@@ -154,19 +163,26 @@ def build(log_text, delta=None):
                 "明天同一时间会自动重试。",
                 ev, True, summary, bal)
     if ok > 0:
-        if bal is None:
+        tail = "（另有 %d 个账号余额未取到，未计入核对）" % unknown if unknown else ""
+        if bal is None or pos is None:
             return ("⚠️", "Trae 服务端返回成功，但缺少余额对比数据",
                     "claim 返回 code=0，但没有拿到签到前后的余额，**无法确认积分真的到账**，"
                     "请人工核对一次（或看下方证据）。",
                     ev, True, summary, bal)
-        if (worst or 0) > 0:
+        # 按账号分别核对：真领取的账号里有多少个余额确实增加了
+        if pos >= ok:
             extra = "，另有 %d 个账号今日已签" % already if already else ""
             return ("✅", "Trae 签到成功：已核对余额增加（%d 个账号）" % ok,
-                    "claim 返回 code=0 且签到前后余额确实增加，积分已到账%s。" % extra,
+                    "claim 返回 code=0 且签到前后余额确实增加，积分已到账%s。%s" % (extra, tail),
                     ev, False, summary, bal)
+        if pos > 0:
+            return ("⚠️", "Trae 部分账号余额未增加（成功 %d 个，余额只增加 %d 个）" % (ok, pos),
+                    "有账号 claim 返回 code=0 但余额没动 —— 可能是服务端记账延迟，"
+                    "也可能没真正到账，**请人工核对一次**。%s" % tail,
+                    ev, True, summary, bal)
         return ("⚠️", "Trae 服务端返回成功，但余额没有增加",
-                "claim 返回 code=0，可是签到前后余额没有变化 —— "
-                "可能是服务端记账延迟，也可能是这次领取没真正到账，**请人工核对一次**。",
+                "claim 返回 code=0，可是所有账号签到前后余额都没有变化 —— "
+                "可能是服务端记账延迟，也可能是这次领取没真正到账，**请人工核对一次**。%s" % tail,
                 ev, True, summary, bal)
     if already > 0:
         return ("☑️", "Trae 今日已签（本次未新领积分）",
