@@ -1,0 +1,28 @@
+name: 积分明细（手动）
+
+# 只读查询，不签到、不改状态；与「Trae 每日签到」那条流程完全独立。
+# 用途：官方规则说签到积分有效期 31 个自然日，这里看每笔积分实际哪天到期。
+# 在 Actions 页面点 Run workflow 即可。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  credits:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: 查询积分明细
+        env:
+          TRAE_ACCOUNTS: ${{ secrets.TRAE_ACCOUNTS }}
+        run: python credits_dump.py
