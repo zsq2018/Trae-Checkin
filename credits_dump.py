@@ -112,9 +112,24 @@ def main():
                 left = "  剩 %.1f 天" % d
             except (TypeError, ValueError):
                 pass
-            k, v = pack_amount(p)
-            print("  [%d] 数量 %s=%s   到期 %s%s" % (i, k or "?", v, bj(exp), left))
-            print("      %s" % json.dumps(describe(p, root), ensure_ascii=False))
+            print("  [%d] 到期 %s%s" % (i, bj(exp), left))
+
+        # 权益包里没有"数量"字段，说明分量挂在别的子结构里 —— 扫全响应找数量类字段
+        AMT = ("amount", "total", "num", "count", "quota", "balance", "credit",
+               "point", "score", "volume", "quantity", "left", "remain", "used", "consume")
+        print()
+        print("  —— 响应里所有「数量类」字段（路径 = 值）——")
+        n = 0
+        for path, val in walk(root):
+            key = path.rsplit(".", 1)[-1].lower()
+            if any(a in key for a in AMT) and not isinstance(val, (dict, list)):
+                print("    %s = %s" % (path, val))
+                n += 1
+                if n >= 80:
+                    break
+        if n == 0:
+            print("    （未找到；完整结构截断 5000 字符如下）")
+            print(json.dumps(root, ensure_ascii=False, indent=1)[:5000])
     print()
     print("完成（只读，未做任何修改）。")
     return 0
