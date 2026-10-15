@@ -33,6 +33,18 @@ def bj(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts + BJ))
 
 
+def walk(obj, path=""):
+    """遍历响应，产出 (路径, 标量值)。"""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from walk(v, path + "." + str(k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:50]):
+            yield from walk(v, path + "[%d]" % i)
+    else:
+        yield path, obj
+
+
 def pack_amount(p):
     """尽力从权益包里找出「数量/剩余」字段。"""
     for k in ("amount", "total_amount", "total", "quantity", "quota",
